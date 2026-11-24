@@ -197,6 +197,7 @@ fn a_moved_point_with_a_scaled_vector_redraws_all_of_it() {
     }
     move_point(&mut d2, id, 6, (2.0, -3.5));
     check(&mut r, &Arc::new(d2), page, &v, "scaled, a point moved");
+}
 
 /// What a patched render reports as changed ([`Retained::patched`]) takes in every pixel that
 /// differs from the image before: whoever holds that image needs no more to have the new one.
@@ -237,4 +238,25 @@ fn a_patched_render_says_where_it_differs_from_the_one_before() {
     assert_eq!(r.patched(), Some(&[][..]));
     r.render(&d2, page, &View { origin: (2.0, 0.0), ..v }, &Options::default()).unwrap();
     assert!(r.patched().is_none(), "a pan");
+}
+
+/// A shape edited inside a card with a drop shadow: the card's shadow is cast from its outline,
+/// which the shape can't change, so only the shape's area is drawn again. (The card's whole
+/// area was, shadow and all: at a zoom where the card is larger than the view, every frame of
+/// a drag was a full render.)
+#[test]
+fn an_edit_inside_a_card_with_a_shadow_redraws_the_edited_layer_only() {
+    let c = crate::zoom_bench_tests::card(true);
+    let v = View { origin: (488.0, 372.0), scale: 3.0, width: 600, height: 400 };
+    let doc = Arc::new(c.doc.clone());
+    let mut r = Retained::default();
+    check(&mut r, &doc, c.page, &v, "first");
+    let mut d2 = (*doc).clone();
+    d2.get_mut(c.shape).unwrap().height = 30.0;
+    let d2 = Arc::new(d2);
+    let (_, _, work) = r.render(&d2, c.page, &v, &Options::default()).unwrap();
+    // The shape is 72 x 49 units, 216 x 147 pixels here; the card and its shadow fill the view.
+    let Work::Partial { pixels } = work else { panic!("a full render: {work:?}") };
+    assert!(pixels < 230 * 160, "{pixels} pixels drawn again");
+    check(&mut r, &d2, c.page, &v, "edited");
 }

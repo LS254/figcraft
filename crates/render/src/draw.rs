@@ -602,6 +602,22 @@ fn to_page(ctx: &Ctx, xf: Affine) -> Affine {
     if ctx.scale.is_finite() && ctx.scale > 0.0 { Affine::scale(1.0 / ctx.scale) * xf } else { xf }
 }
 
+/// Whether drop shadows are all that asks for a layer of `n`'s own (see [`needs_layer`]): it is
+/// opaque, blends as its parent does and has no other effect.
+fn shadows_only(n: &Node) -> bool {
+    n.opacity >= 0.999
+        && matches!(n.blend, BlendMode::Normal | BlendMode::PassThrough)
+        && !n.isolates_children()
+        && n.effects.iter().filter(|e| e.visible).all(|e| matches!(e.kind, EffectKind::DropShadow(_)))
+}
+
+/// Whether the drop shadows of `n` that hide behind it (cast from its outline, see
+/// [`shadow::outline_caster`]) show nowhere on a `size` pixmap it is drawn onto at `xf`: a
+/// box with a fill that takes in the whole pixmap (close up, a band or patch inside a card).
+fn shadows_hidden(n: &Node, xf: Affine, size: (u32, u32)) -> bool {
+    (n.kind.is_frame_like() || matches!(n.kind, NodeKind::Rectangle)) && n.fills.iter().any(|f| f.visible) && clip_covers(n, xf, size)
+}
+
 fn needs_layer(n: &Node) -> bool {
     n.opacity < 0.999
         || !matches!(n.blend, BlendMode::Normal | BlendMode::PassThrough)
@@ -722,6 +738,22 @@ fn draw_layer(ctx: &Ctx, pix: &mut Pixmap, n: &Node, parent_xf: Affine, depth: u
     // Drop shadows cast from the layer's outline need none of its pixels: the layer then ends
     // where the pixmap does (plus what its other effects read), however far the shadows reach.
     let cast_outline = if ctx.lod || backdrop::has_effects(n) { None } else { shadow::outline_caster(ctx.doc, n) };
+    if let Some(outlines) = &cast_outline
+        && shadows_only(n)
+    {
+        // Nothing else asks for a layer: the shadows go onto the pixmap and the node over them.
+        let cover = shadow::hiding_cover(ctx.doc, n);
+        let hidden = shadows_hidden(n, xf, (pw, ph));
+        for s in n.effects.iter().filter(|e| e.visible).filter_map(|e| if let EffectKind::DropShadow(s) = &e.kind { Some(s) } else { None }) {
+            if (!hidden || s.show_behind)
+                && let Some((sh, at)) = shadow::outline_drop_shadow(outlines, cover.as_deref().unwrap_or(outlines), s, xf, ctx.scale, (pw, ph))
+            {
+                composite(pix, at, &sh, 1.0, s.blend);
+            }
+        }
+        draw_content(ctx, pix, n, xf, depth, None);
+        return;
+    }
     let view = match &cast_outline {
         Some(_) => {
             let m = (margin_of(n, false) * ctx.scale).min(MAX_EFFECT_MARGIN_PX);
@@ -802,8 +834,10 @@ fn draw_layer(ctx: &Ctx, pix: &mut Pixmap, n: &Node, parent_xf: Affine, depth: u
     // Drop shadows go under the layer, in effect-list order.
     if let Some(outlines) = &cast_outline {
         let cover = shadow::hiding_cover(ctx.doc, n);
+        let hidden = shadows_hidden(n, xf, (pw, ph));
         for e in n.effects.iter().filter(|e| e.visible) {
             if let EffectKind::DropShadow(s) = &e.kind
+                && (!hidden || s.show_behind)
                 && let Some((sh, at)) = shadow::outline_drop_shadow(outlines, cover.as_deref().unwrap_or(outlines), s, xf, ctx.scale, (pw, ph))
             {
                 composite(pix, at, &sh, op, s.blend);

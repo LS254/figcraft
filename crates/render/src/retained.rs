@@ -402,7 +402,10 @@ fn ancestor_areas(doc: &Document, id: NodeId, out: &mut Vec<Rect>) -> Option<()>
         if an.is_page() {
             break;
         }
-        if matches!(an.kind, NodeKind::BooleanOp { .. }) || an.is_mask || an.effects.iter().any(|e| e.visible) {
+        // Not one whose effects are shadows cast from its outline: what its children paint
+        // inside it changes neither the outline nor the shadows.
+        let from_pixels = an.effects.iter().any(|e| e.visible) && crate::shadow::outline_caster(doc, an).is_none();
+        if matches!(an.kind, NodeKind::BooleanOp { .. }) || an.is_mask || from_pixels {
             out.push(draw::paint_bounds(doc, a)?);
         }
     }
