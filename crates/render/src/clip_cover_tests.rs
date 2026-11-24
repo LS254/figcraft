@@ -117,3 +117,64 @@ fn a_view_inside_clipping_frames_holds_no_layer_for_them() {
     NO_COVER_SHORTCUTS.with(|f| f.set(false));
     assert!(before >= u64::from(v.width) * u64::from(v.height) * 4, "as it was: {before} bytes held");
 }
+
+/// A blurred layer under a panel that takes in the view, with `panel` applied to the panel.
+fn under_a_panel(panel: fn(&mut Document, NodeId)) -> (Document, NodeId) {
+    let mut d = Document::new("hidden");
+    let page = d.first_page().unwrap();
+    let under = d.create(page, NodeKind::Rectangle, "Under", 40.0, 40.0, 200.0, 120.0).unwrap();
+    d.get_mut(under).unwrap().fills = vec![Paint::solid(Color::from_hex("E03030").unwrap())];
+    d.get_mut(under)
+        .unwrap()
+        .effects
+        .push(figcraft_doc::Effect { kind: figcraft_doc::EffectKind::LayerBlur(figcraft_doc::Blur::uniform(6.0)), visible: true });
+    let group = d.create(page, NodeKind::Group, "Group", 0.0, 0.0, 400.0, 300.0).unwrap();
+    let frame = d.create(group, NodeKind::Frame, "Panel", 0.0, 0.0, 400.0, 300.0).unwrap();
+    d.get_mut(frame).unwrap().fills = vec![Paint::solid(Color::from_hex("F4F6F5").unwrap())];
+    let dot = d.create(frame, NodeKind::Ellipse { start: 0.0, sweep: std::f64::consts::TAU, inner: 0.0 }, "Dot", 120.0, 90.0, 60.0, 60.0).unwrap();
+    d.get_mut(dot).unwrap().fills = vec![Paint::solid(Color::from_hex("2040E0").unwrap())];
+    panel(&mut d, frame);
+    (d, page)
+}
+
+/// The bytes of layers a render of the middle of the scene held at most.
+fn held(d: &Document, page: NodeId) -> u64 {
+    let v = View { origin: (60.0, 60.0), scale: 2.0, width: 300, height: 200 };
+    crate::layer_budget::within(crate::layer_budget::BUDGET, || render_view_single(d, page, &v, &white())).1
+}
+
+#[test]
+fn layers_under_one_that_hides_them_are_not_drawn() {
+    let v = View { origin: (60.0, 60.0), scale: 2.0, width: 300, height: 200 };
+    // The panel (in a group) takes in the view: the blurred layer under it needs no layer.
+    let (d, page) = under_a_panel(|_, _| {});
+    assert_eq!(held(&d, page), 0, "nothing drawn under the panel");
+    let (new, old) = both(&d, page, &v);
+    assert_eq!(new.data(), old.data(), "and the picture is the same");
+    // Seen through, blended, faded, masked, cut off or blurred itself, the panel hides nothing.
+    type Panel = fn(&mut Document, NodeId);
+    let shows: [(&str, Panel); 6] = [
+        ("a see-through fill", |d, f| d.get_mut(f).unwrap().fills = vec![Paint::solid(Color { a: 0.5, ..Color::WHITE })]),
+        ("a blend mode", |d, f| d.get_mut(f).unwrap().blend = figcraft_color::BlendMode::Multiply),
+        ("faded", |d, f| d.get_mut(f).unwrap().opacity = 0.5),
+        ("a mask under it", |d, f| {
+            let group = d.node(f).unwrap().parent.unwrap();
+            let m = d.create(group, NodeKind::Rectangle, "Mask", 0.0, 0.0, 150.0, 300.0).unwrap();
+            d.get_mut(m).unwrap().fills = vec![Paint::solid(Color::BLACK)];
+            d.get_mut(m).unwrap().is_mask = true;
+            let kids = &mut d.get_mut(group).unwrap().children;
+            kids.rotate_right(1);
+        }),
+        ("smaller than the view", |d, f| d.get_mut(f).unwrap().width = 150.0),
+        ("a round corner in view", |d, f| {
+            d.get_mut(f).unwrap().transform = Affine::translate((62.0, 62.0));
+            d.get_mut(f).unwrap().corners.radii = [80.0; 4];
+        }),
+    ];
+    for (what, panel) in shows {
+        let (d, page) = under_a_panel(panel);
+        assert!(held(&d, page) > 0, "{what}: the layer under the panel is drawn");
+        let (new, old) = both(&d, page, &v);
+        assert_same(&new, &old, what);
+    }
+}

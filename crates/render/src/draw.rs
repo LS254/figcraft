@@ -999,7 +999,9 @@ fn draw_content(ctx: &Ctx, pix: &mut Pixmap, n: &Node, xf: Affine, depth: usize,
             // The outline fills, clips children to rounded corners and strokes booleans.
             let outline =
                 if styled_network.is_some() || (splatted && !(clips && n.corners.uniform() != Some(0.0))) { None } else { node_outline(doc, n) };
-            if !splatted && closed {
+            // A child that hides everything under it hides this layer's fills too.
+            let painted_over = children_cover(ctx, n, xf, (pix.width(), pix.height()), depth);
+            if !painted_over && !splatted && closed {
                 if let Some(network) = styled_network {
                     fill_vector_regions(ctx, pix, n, network, xf);
                 } else if let Some((path, rule)) = &outline
@@ -1008,7 +1010,7 @@ fn draw_content(ctx: &Ctx, pix: &mut Pixmap, n: &Node, xf: Affine, depth: usize,
                     fill_with(pix, &tp, &n.fills, w, h, xf, *rule, ctx, None);
                 }
             }
-            if let Some(f) = over_fills {
+            if let Some(f) = over_fills.filter(|_| !painted_over) {
                 f(pix);
             }
             if !matches!(n.kind, NodeKind::BooleanOp { .. }) && !n.children.is_empty() && !n.hides_contents() {
@@ -1034,17 +1036,112 @@ fn draw_content(ctx: &Ctx, pix: &mut Pixmap, n: &Node, xf: Affine, depth: usize,
     }
 }
 
+/// Layers looked at, at most, to find one that hides what is under it ([`covers_opaquely`]).
+const COVER_LOOKS: usize = 256;
+
+/// Whether `p` leaves nothing of what is under it to see wherever it paints: an opaque colour or
+/// a gradient of opaque colours, blended normally.
+fn hides(p: &Paint) -> bool {
+    p.visible
+        && p.opacity >= 1.0
+        && p.blend == BlendMode::Normal
+        && match &p.kind {
+            PaintKind::Solid { color } => color.a >= 1.0,
+            PaintKind::Gradient(g) => !g.stops.is_empty() && g.stops.iter().all(|s| s.color.a >= 1.0),
+            _ => false,
+        }
+}
+
+/// Whether layers are left out when a later one hides them: not where layers draw as outlines
+/// or as stand-ins for what is too small to see.
+fn culls_hidden(ctx: &Ctx) -> bool {
+    !ctx.outline_mode && ctx.outlined.is_empty() && !ctx.lod
+}
+
+/// Whether node `n`, drawn at `xf` (its own transform included), leaves nothing to see of what
+/// was drawn before it anywhere on a `size` pixmap: a box with an opaque fill that takes in the
+/// whole pixmap, or a frame or group that neither clips it off nor changes its pixels around one.
+/// Close up, the view lies inside a card on a screen: the screen's fill, the card's and every
+/// layer under them are painted over. `looks` bounds the search.
+fn covers_opaquely(ctx: &Ctx, n: &Node, xf: Affine, size: (u32, u32), looks: &mut usize, depth: usize) -> bool {
+    if *looks == 0 || depth > crate::MAX_EXPORT_DEPTH {
+        return false;
+    }
+    *looks -= 1;
+    let as_is = n.visible
+        && !n.is_mask
+        && n.opacity >= 0.999
+        && matches!(n.blend, BlendMode::Normal | BlendMode::PassThrough)
+        && n.effects.iter().filter(|e| e.visible).all(|e| matches!(e.kind, EffectKind::DropShadow(_) | EffectKind::InnerShadow(_)))
+        && !ctx.skip.contains(&n.id);
+    if !as_is {
+        return false;
+    }
+    let frame = n.kind.is_frame_like();
+    if (frame || matches!(n.kind, NodeKind::Rectangle)) && n.fills.iter().any(hides) && clip_covers(n, xf, size) {
+        return true;
+    }
+    // Through a frame or group to its children: unless it cuts them off here, hides them, or one
+    // of them is a mask (which cuts the ones above it).
+    if !(frame || matches!(n.kind, NodeKind::Group)) || n.hides_contents() || (frame && n.clip && !clip_covers(n, xf, size)) {
+        return false;
+    }
+    let kids: Vec<&Node> = n.children.iter().filter_map(|c| ctx.bounds.node(ctx.doc, *c)).collect();
+    !kids.iter().any(|c| c.is_mask && c.visible) && kids.iter().rev().any(|c| covers_opaquely(ctx, c, xf * c.transform, size, looks, depth + 1))
+}
+
+/// Whether one of the children of `n` (drawn at `xf`) hides everything under it on a `size`
+/// pixmap, `n`'s own fill included: see [`covers_opaquely`].
+pub(crate) fn children_cover(ctx: &Ctx, n: &Node, xf: Affine, size: (u32, u32), depth: usize) -> bool {
+    if !culls_hidden(ctx) || n.children.is_empty() || matches!(n.kind, NodeKind::BooleanOp { .. }) || n.hides_contents() {
+        return false;
+    }
+    if n.kind.is_frame_like() && n.clip && !clip_covers(n, xf, size) {
+        return false;
+    }
+    let kids: Vec<&Node> = n.children.iter().filter_map(|c| ctx.bounds.node(ctx.doc, *c)).collect();
+    let mut looks = COVER_LOOKS;
+    !kids.iter().any(|c| c.is_mask && c.visible) && kids.iter().rev().any(|c| covers_opaquely(ctx, c, xf * c.transform, size, &mut looks, depth + 1))
+}
+
 fn draw_children(ctx: &Ctx, pix: &mut Pixmap, n: &Node, xf: Affine, depth: usize) {
+    draw_children_at(ctx, pix, n, xf, (depth + 1, depth));
+}
+
+/// The layers of page `p`, drawn at `xf`.
+pub(crate) fn draw_page(ctx: &Ctx, pix: &mut Pixmap, p: &Node, xf: Affine) {
+    draw_children_at(ctx, pix, p, xf, (0, 0));
+}
+
+/// The children of `n`: each a layer `depths.0` levels deep, mask groups among them `depths.1`.
+fn draw_children_at(ctx: &Ctx, pix: &mut Pixmap, n: &Node, xf: Affine, depths: (usize, usize)) {
     let kids = &n.children;
     // Each child looked up once: in a large document a lookup is a good part of a layer's cost.
     let nodes: Vec<Option<&Node>> = kids.iter().map(|c| ctx.bounds.node(ctx.doc, *c)).collect();
-    for run in Document::paint_runs_of(&nodes, n.layout.as_ref().is_some_and(|l| l.reverse_z)) {
+    // A page's layers draw one by one (a mask straight on the page masks nothing, as before).
+    let runs = if n.is_page() {
+        (0..kids.len()).map(|i| i..i + 1).collect()
+    } else {
+        Document::paint_runs_of(&nodes, n.layout.as_ref().is_some_and(|l| l.reverse_z))
+    };
+    // The last layer that hides everything under it: the ones painted before it are left out.
+    let size = (pix.width(), pix.height());
+    let mut looks = COVER_LOOKS;
+    let from = if culls_hidden(ctx) {
+        runs.iter().rposition(|run| {
+            run.len() == 1
+                && nodes.get(run.start).copied().flatten().is_some_and(|c| covers_opaquely(ctx, c, xf * c.transform, size, &mut looks, depths.0))
+        })
+    } else {
+        None
+    };
+    for run in runs.into_iter().skip(from.unwrap_or(0)) {
         let (Some(&c), Some(Some(cn))) = (kids.get(run.start), nodes.get(run.start)) else { continue };
-        if cn.is_mask && cn.visible {
+        if cn.is_mask && cn.visible && !n.is_page() {
             // Everything above the mask (until the next mask) is clipped by its alpha.
-            draw_masked(ctx, pix, c, kids.get(run.start + 1..run.end).unwrap_or(&[]), xf, depth);
+            draw_masked(ctx, pix, c, kids.get(run.start + 1..run.end).unwrap_or(&[]), xf, depths.1);
         } else {
-            draw_layer(ctx, pix, cn, xf, depth + 1);
+            draw_layer(ctx, pix, cn, xf, depths.0);
         }
     }
 }

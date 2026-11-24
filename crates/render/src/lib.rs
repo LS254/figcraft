@@ -281,12 +281,6 @@ fn render_one(doc: &Document, page: NodeId, view: &View, opts: &Options) -> Opti
         Some(NodeKind::Page { background, .. }) => Some(*background),
         _ => None,
     });
-    if let Some(bg) = bg {
-        pix.fill(paint::ts_color(bg));
-        if let Some(d) = &opts.dots {
-            dots::draw(&mut pix, view, d);
-        }
-    }
     let lod = opts.lod && !opts.outline_mode && view.scale <= lod::MAX_SCALE;
     let bounds = draw::Bounds::default();
     let ctx = draw::Ctx {
@@ -304,14 +298,19 @@ fn render_one(doc: &Document, page: NodeId, view: &View, opts: &Options) -> Opti
         bounds: &bounds,
     };
     let xf = view.transform();
+    // A layer that hides everything under it (close up, the frame the view lies in) hides the
+    // page too.
+    let painted_over = opts.solo.is_none() && doc.node(page).is_some_and(|p| draw::children_cover(&ctx, p, xf, (view.width, view.height), 0));
+    if let Some(bg) = bg.filter(|_| !painted_over) {
+        pix.fill(paint::ts_color(bg));
+        if let Some(d) = &opts.dots {
+            dots::draw(&mut pix, view, d);
+        }
+    }
     let Some(p) = doc.node(page) else { return Some(pix) };
     match opts.solo.filter(|id| *id != page && doc.page_of(*id) == Some(page)) {
         Some(id) => draw::draw_node(&ctx, &mut pix, id, xf * parent_transform(doc, id), 0),
-        None => {
-            for c in &p.children {
-                draw::draw_node(&ctx, &mut pix, *c, xf, 0);
-            }
-        }
+        None => draw::draw_page(&ctx, &mut pix, p, xf),
     }
     Some(pix)
 }
