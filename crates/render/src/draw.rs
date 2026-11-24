@@ -1238,25 +1238,9 @@ pub(crate) fn clip_covers(n: &Node, xf: Affine, size: (u32, u32)) -> bool {
     if !(det.is_finite() && det.abs() > 1e-12 && w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
         return false;
     }
-    let max_r = w.min(h) / 2.0;
-    let smooth = if n.corners.smoothing > 0.0 || !n.corners.smoothing.is_finite() { 1.0 } else { 0.0 };
-    // Top-left, top-right, bottom-right, bottom-left: the corner and its radius.
-    let r = n.corners.radii.map(|r| if r.is_finite() { r.clamp(0.0, max_r) } else { max_r });
-    let corners = [(0.0, 0.0, r[0]), (w, 0.0, r[1]), (w, h, r[2]), (0.0, h, r[3])];
-    let inside = |p: figcraft_geom::Point| {
-        if !(p.x >= 0.0 && p.y >= 0.0 && p.x <= w && p.y <= h) {
-            return false;
-        }
-        corners.iter().all(|(cx, cy, r)| {
-            let (dx, dy) = ((p.x - cx).abs(), (p.y - cy).abs());
-            let zone = r * (1.0 + smooth);
-            // Outside the corner's square, or (a round corner) within its arc.
-            dx >= zone || dy >= zone || (smooth == 0.0 && (r - dx).powi(2) + (r - dy).powi(2) <= r * r)
-        })
-    };
     let inv = xf.inverse();
     let (pw, ph) = (f64::from(size.0), f64::from(size.1));
-    [(0.0, 0.0), (pw, 0.0), (pw, ph), (0.0, ph)].into_iter().all(|p| inside(inv * figcraft_geom::Point::new(p.0, p.1)))
+    [(0.0, 0.0), (pw, 0.0), (pw, ph), (0.0, ph)].into_iter().all(|p| in_box(n, inv * figcraft_geom::Point::new(p.0, p.1)))
 }
 
 /// Whether point `p` (local) lies in the box of `n`, its rounded corners cut off. Errs towards
